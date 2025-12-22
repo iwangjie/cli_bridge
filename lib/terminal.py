@@ -132,6 +132,11 @@ class TerminalBackend(ABC):
 
 
 class TmuxBackend(TerminalBackend):
+    @staticmethod
+    def _is_pane_token(target: str) -> bool:
+        # tmux pane ids look like "%12"
+        return bool(target) and target.startswith("%")
+
     def send_text(self, session: str, text: str) -> None:
         sanitized = text.replace("\r", "").strip()
         if not sanitized:
@@ -155,16 +160,46 @@ class TmuxBackend(TerminalBackend):
             subprocess.run(["tmux", "delete-buffer", "-b", buffer_name], stderr=subprocess.DEVNULL)
 
     def is_alive(self, session: str) -> bool:
-        result = subprocess.run(["tmux", "has-session", "-t", session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if self._is_pane_token(session):
+            result = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", session, "#{pane_id}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return result.returncode == 0
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", session],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         return result.returncode == 0
 
     def kill_pane(self, session: str) -> None:
+        if self._is_pane_token(session):
+            subprocess.run(["tmux", "kill-pane", "-t", session], stderr=subprocess.DEVNULL)
+            return
         subprocess.run(["tmux", "kill-session", "-t", session], stderr=subprocess.DEVNULL)
 
     def activate(self, session: str) -> None:
+        if self._is_pane_token(session):
+            subprocess.run(["tmux", "select-pane", "-t", session], stderr=subprocess.DEVNULL)
+            return
         subprocess.run(["tmux", "attach", "-t", session])
 
     def create_pane(self, cmd: str, cwd: str, direction: str = "right", percent: int = 50, parent_pane: Optional[str] = None) -> str:
+        # If we're already running inside a tmux client, prefer splitting the current window.
+        if os.environ.get("TMUX"):
+            args = ["tmux", "split-window", "-P", "-F", "#{pane_id}", "-c", cwd, "-p", str(percent)]
+            if direction == "right":
+                args.append("-h")
+            elif direction == "bottom":
+                args.append("-v")
+            if parent_pane:
+                args.extend(["-t", parent_pane])
+            args.append(cmd)
+            result = subprocess.run(args, capture_output=True, text=True, check=True)
+            return result.stdout.strip()
+
         session_name = f"ai-{int(time.time()) % 100000}-{os.getpid()}"
         subprocess.run(["tmux", "new-session", "-d", "-s", session_name, "-c", cwd, cmd], check=True)
         return session_name

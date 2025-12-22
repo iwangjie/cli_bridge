@@ -211,6 +211,7 @@ class AILauncher:
         self.wezterm_panes = {}
         self.iterm2_panes = {}
         self.processes = {}
+        self._tmux_root_pane = None
 
     def _detect_terminal_type(self):
         # Forced by environment variable
@@ -232,6 +233,154 @@ class AILauncher:
 
         # Fallback: if nothing found, return None for later handling
         return None
+
+    def _in_tmux_client(self) -> bool:
+        return bool(os.environ.get("TMUX"))
+
+    def _tmux_split_layout_enabled(self) -> bool:
+        # When already inside tmux, default to split-pane layout (Claude left, backends right).
+        # Override with: CCB_TMUX_LAYOUT=external
+        value = (os.environ.get("CCB_TMUX_LAYOUT") or "").strip().lower()
+        return value not in {"external", "0", "false", "no", "off"}
+
+    def _tmux_current_pane(self) -> str:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#{pane_id}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    def _tmux_session_and_window_for_pane(self, pane_id: str) -> tuple[str, str]:
+        session = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane_id, "#{session_name}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        window = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane_id, "#{window_id}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        return session, window
+
+    def _start_provider_tmux_panes(self, provider: str) -> bool:
+        backend = TmuxBackend()
+        if not self._tmux_root_pane:
+            self._tmux_root_pane = self._tmux_current_pane()
+
+        runtime = self.runtime_dir / provider
+        runtime.mkdir(parents=True, exist_ok=True)
+
+        work_dir = str(Path.cwd())
+        start_cmd = self._get_start_cmd(provider)
+
+        if provider == "codex":
+            input_fifo = runtime / "input.fifo"
+            output_fifo = runtime / "output.fifo"
+
+            if not input_fifo.exists():
+                os.mkfifo(input_fifo, 0o600)
+            if not output_fifo.exists():
+                os.mkfifo(output_fifo, 0o644)
+
+            bridge_script = self.script_dir / "lib" / "codex_dual_bridge.py"
+            wrapper = f'''#!/bin/bash
+set -euo pipefail
+SESSION_ID="{self.session_id}"
+RUNTIME_DIR="{runtime}"
+BRIDGE_SCRIPT="{bridge_script}"
+PYTHON_BIN="{sys.executable}"
+SCRIPT_DIR="{self.script_dir}"
+WORK_DIR="{os.getcwd()}"
+INPUT_FIFO="{input_fifo}"
+OUTPUT_FIFO="{output_fifo}"
+TMUX_LOG_FILE="{runtime}/bridge_output.log"
+CODEX_START_CMD={json.dumps(start_cmd)}
+
+PANE_ID="$(tmux display-message -p '#{{pane_id}}')"
+
+echo $$ > "$RUNTIME_DIR/codex.pid"
+export PYTHONPATH="$SCRIPT_DIR:${{PYTHONPATH:-}}"
+export CODEX_SESSION_ID="$SESSION_ID"
+export CODEX_RUNTIME_DIR="$RUNTIME_DIR"
+export CODEX_INPUT_FIFO="$INPUT_FIFO"
+export CODEX_OUTPUT_FIFO="$OUTPUT_FIFO"
+export CODEX_TMUX_SESSION="$PANE_ID"
+export CODEX_TMUX_LOG="$TMUX_LOG_FILE"
+
+tmux pipe-pane -o -t "$PANE_ID" "cat >> '$TMUX_LOG_FILE'" 2>/dev/null || true
+
+cd "$WORK_DIR"
+"$PYTHON_BIN" "$BRIDGE_SCRIPT" --runtime-dir "$RUNTIME_DIR" --session-id "$SESSION_ID" >>"$RUNTIME_DIR/bridge.log" 2>&1 &
+BRIDGE_PID=$!
+echo $BRIDGE_PID > "$RUNTIME_DIR/bridge.pid"
+
+trap 'kill -TERM "$BRIDGE_PID" 2>/dev/null || true' EXIT
+exec bash -lc "$CODEX_START_CMD"
+'''
+            script_file = runtime / "wrapper.sh"
+            script_file.write_text(wrapper)
+            os.chmod(script_file, 0o755)
+
+            pane_id = backend.create_pane(str(script_file), work_dir, direction="right", percent=50, parent_pane=self._tmux_root_pane)
+            self.tmux_sessions[provider] = pane_id
+            backend.activate(self._tmux_root_pane)
+
+            parent_session, parent_window = self._tmux_session_and_window_for_pane(pane_id)
+            self._write_codex_session(
+                runtime,
+                pane_id,
+                input_fifo,
+                output_fifo,
+                pane_id=pane_id,
+                tmux_parent_session=parent_session,
+                tmux_parent_window=parent_window,
+            )
+            print(f"✅ {t('started_backend', provider='Codex', terminal='tmux', pane_id=pane_id)}")
+            return True
+
+        if provider == "gemini":
+            wrapper = f'''#!/bin/bash
+set -euo pipefail
+RUNTIME_DIR="{runtime}"
+WORK_DIR="{os.getcwd()}"
+GEMINI_START_CMD={json.dumps(start_cmd)}
+
+echo $$ > "$RUNTIME_DIR/gemini.pid"
+cd "$WORK_DIR"
+exec bash -lc "$GEMINI_START_CMD"
+'''
+            script_file = runtime / "wrapper.sh"
+            script_file.write_text(wrapper)
+            os.chmod(script_file, 0o755)
+
+            codex_pane = self.tmux_sessions.get("codex")
+            if codex_pane:
+                parent, direction = codex_pane, "bottom"
+            else:
+                parent, direction = self._tmux_root_pane, "right"
+
+            pane_id = backend.create_pane(str(script_file), work_dir, direction=direction, percent=50, parent_pane=parent)
+            self.tmux_sessions[provider] = pane_id
+            backend.activate(self._tmux_root_pane)
+
+            parent_session, parent_window = self._tmux_session_and_window_for_pane(pane_id)
+            self._write_gemini_session(
+                runtime,
+                pane_id,
+                pane_id=pane_id,
+                tmux_parent_session=parent_session,
+                tmux_parent_window=parent_window,
+            )
+            print(f"✅ {t('started_backend', provider='Gemini', terminal='tmux', pane_id=pane_id)}")
+            return True
+
+        print(f"❌ {t('unknown_provider', provider=provider)}")
+        return False
 
     def _detect_launch_terminal(self):
         """Select terminal program for launching new windows (tmux mode only)"""
@@ -293,6 +442,11 @@ class AILauncher:
                 print(f"❌ {t('tmux_not_installed')}")
                 print(f"   {t('install_wezterm_or_tmux')}")
                 return False
+
+        # When already running inside tmux, prefer a split-pane layout in the current window.
+        if self._in_tmux_client() and self._tmux_split_layout_enabled():
+            print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='tmux (split panes)')}")
+            return self._start_provider_tmux_panes(provider)
 
         print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='tmux')}")
 
@@ -737,7 +891,7 @@ exec tmux attach -t "$TMUX_SESSION"
         print(f"✅ {t('started_backend', provider='Gemini', terminal='tmux', pane_id=tmux_session)}")
         return True
 
-    def _write_codex_session(self, runtime, tmux_session, input_fifo, output_fifo, pane_id=None):
+    def _write_codex_session(self, runtime, tmux_session, input_fifo, output_fifo, pane_id=None, tmux_parent_session=None, tmux_parent_window=None):
         session_file = Path.cwd() / ".codex-session"
 
         # Pre-check permissions
@@ -760,6 +914,8 @@ exec tmux attach -t "$TMUX_SESSION"
             "terminal": self.terminal_type,
             "tmux_session": tmux_session,
             "pane_id": pane_id,
+            "tmux_parent_session": tmux_parent_session,
+            "tmux_parent_window": tmux_parent_window,
             "tmux_log": str(runtime / "bridge_output.log"),
             "work_dir": str(work_dir),
             "work_dir_norm": _normalize_path_for_match(str(work_dir)),
@@ -773,7 +929,7 @@ exec tmux attach -t "$TMUX_SESSION"
             return False
         return True
 
-    def _write_gemini_session(self, runtime, tmux_session, pane_id=None):
+    def _write_gemini_session(self, runtime, tmux_session, pane_id=None, tmux_parent_session=None, tmux_parent_window=None):
         session_file = Path.cwd() / ".gemini-session"
 
         # Pre-check permissions
@@ -789,6 +945,8 @@ exec tmux attach -t "$TMUX_SESSION"
             "terminal": self.terminal_type,
             "tmux_session": tmux_session,
             "pane_id": pane_id,
+            "tmux_parent_session": tmux_parent_session,
+            "tmux_parent_window": tmux_parent_window,
             "work_dir": str(Path.cwd()),
             "active": True,
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -979,9 +1137,14 @@ exec tmux attach -t "$TMUX_SESSION"
                 if pane_id:
                     backend.kill_pane(pane_id)
         else:
-            for provider, tmux_session in self.tmux_sessions.items():
-                subprocess.run(["tmux", "kill-session", "-t", tmux_session], stderr=subprocess.DEVNULL)
-                subprocess.run(["tmux", "kill-session", "-t", f"launcher-{tmux_session}"], stderr=subprocess.DEVNULL)
+            backend = TmuxBackend()
+            for provider, tmux_target in self.tmux_sessions.items():
+                if not tmux_target:
+                    continue
+                backend.kill_pane(tmux_target)
+                # Legacy launcher session cleanup (only applies to session-based tmux mode).
+                if not tmux_target.startswith("%"):
+                    subprocess.run(["tmux", "kill-session", "-t", f"launcher-{tmux_target}"], stderr=subprocess.DEVNULL)
 
         for session_file in [Path.cwd() / ".codex-session", Path.cwd() / ".gemini-session", Path.cwd() / ".claude-session"]:
             if session_file.exists():
@@ -1014,7 +1177,9 @@ exec tmux attach -t "$TMUX_SESSION"
         signal.signal(signal.SIGTERM, lambda s, f: (self.cleanup(), sys.exit(0)))
 
         providers = list(self.providers)
-        if self.terminal_type in ("wezterm", "iterm2"):
+        if self.terminal_type in ("wezterm", "iterm2") or (
+            self.terminal_type == "tmux" and self._in_tmux_client() and self._tmux_split_layout_enabled()
+        ):
             # Stable layout: codex on top, gemini on bottom (when both are present).
             order = {"codex": 0, "gemini": 1}
             providers.sort(key=lambda p: order.get(p, 99))
@@ -1039,7 +1204,10 @@ exec tmux attach -t "$TMUX_SESSION"
                 else:
                     tmux = self.tmux_sessions.get(provider, "")
                     if tmux:
-                        print(f"   {provider}: tmux attach -t {tmux}")
+                        if tmux.startswith("%"):
+                            print(f"   {provider}: tmux select-pane -t {tmux}")
+                        else:
+                            print(f"   {provider}: tmux attach -t {tmux}")
             print()
             print(f"Kill: ccb kill {' '.join(self.providers)}")
             atexit.unregister(self.cleanup)
@@ -1084,8 +1252,8 @@ def cmd_status(args):
                 backend = Iterm2Backend()
                 alive = backend.is_alive(pane_id)
             elif pane_id and shutil.which("tmux"):
-                result = subprocess.run(["tmux", "has-session", "-t", pane_id], capture_output=True)
-                alive = result.returncode == 0
+                backend = TmuxBackend()
+                alive = backend.is_alive(pane_id)
             else:
                 alive = False
 
@@ -1130,8 +1298,11 @@ def cmd_kill(args):
                 backend = Iterm2Backend()
                 backend.kill_pane(pane_id)
             elif pane_id and shutil.which("tmux"):
-                subprocess.run(["tmux", "kill-session", "-t", pane_id], stderr=subprocess.DEVNULL)
-                subprocess.run(["tmux", "kill-session", "-t", f"launcher-{pane_id}"], stderr=subprocess.DEVNULL)
+                backend = TmuxBackend()
+                backend.kill_pane(pane_id)
+                # Legacy launcher session cleanup (only applies to session-based tmux mode).
+                if not pane_id.startswith("%"):
+                    subprocess.run(["tmux", "kill-session", "-t", f"launcher-{pane_id}"], stderr=subprocess.DEVNULL)
 
             data["active"] = False
             data["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1170,9 +1341,17 @@ def cmd_restore(args):
                     backend.activate(pane_id)
                     return 0
             elif pane_id and shutil.which("tmux"):
-                result = subprocess.run(["tmux", "has-session", "-t", pane_id], capture_output=True)
-                if result.returncode == 0:
-                    subprocess.run(["tmux", "attach-session", "-t", pane_id])
+                backend = TmuxBackend()
+                if backend.is_alive(pane_id):
+                    # If this was started in split-pane mode, the saved "pane id" only makes sense
+                    # when you're attached to the same tmux server. If we're currently outside tmux,
+                    # attach to the recorded parent session first.
+                    if pane_id.startswith("%") and not os.environ.get("TMUX"):
+                        parent_session = (data.get("tmux_parent_session") or "").strip()
+                        if parent_session:
+                            subprocess.run(["tmux", "attach", "-t", parent_session, ";", "select-pane", "-t", pane_id])
+                            return 0
+                    backend.activate(pane_id)
                     return 0
 
             if not active:
