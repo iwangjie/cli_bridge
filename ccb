@@ -195,11 +195,14 @@ def _build_keep_open_cmd(provider: str, start_cmd: str) -> str:
 
 
 class AILauncher:
-    def __init__(self, providers: list, resume: bool = False, auto: bool = False, no_claude: bool = False):
+    def __init__(self, providers: list, resume: bool = False, auto: bool = False, no_claude: bool = False,
+                 codex_model: str = None, gemini_model: str = None):
         self.providers = providers or ["codex"]
         self.resume = resume
         self.auto = auto
         self.no_claude = no_claude
+        self.codex_model = codex_model
+        self.gemini_model = gemini_model
         self.script_dir = Path(__file__).resolve().parent
         self.session_id = f"ai-{int(time.time())}-{os.getpid()}"
         self.temp_base = Path(tempfile.gettempdir())
@@ -674,6 +677,8 @@ exec bash -lc "$GEMINI_START_CMD"
 
     def _build_codex_start_cmd(self) -> str:
         cmd = "codex -c disable_paste_burst=true --full-auto" if self.auto else "codex -c disable_paste_burst=true"
+        if self.codex_model:
+            cmd = f"{cmd} -m {self.codex_model}"
         codex_resumed = False
         if self.resume:
             session_id, has_history = self._get_latest_codex_session_id()
@@ -728,6 +733,8 @@ exec bash -lc "$GEMINI_START_CMD"
 
     def _build_gemini_start_cmd(self) -> str:
         cmd = "gemini --yolo" if self.auto else "gemini"
+        if self.gemini_model:
+            cmd = f"{cmd} -m {self.gemini_model}"
         if self.resume:
             _, has_history = self._get_latest_gemini_project_hash()
             if has_history:
@@ -1234,6 +1241,8 @@ def cmd_up(args):
         resume=args.resume,
         auto=args.auto,
         no_claude=args.no_claude,
+        codex_model=args.codex_model,
+        gemini_model=args.gemini_model,
     )
     return launcher.run_up()
 
@@ -1728,6 +1737,8 @@ def main():
     up_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context")
     up_parser.add_argument("-a", "--auto", action="store_true", help="Full auto permission mode")
     up_parser.add_argument("--no-claude", action="store_true", help="Don't start Claude main window")
+    up_parser.add_argument("--codex-model", metavar="MODEL", help="Model for Codex (e.g., gpt-4.1, o3)")
+    up_parser.add_argument("--gemini-model", metavar="MODEL", help="Model for Gemini (e.g., gemini-2.5-pro)")
 
     # status subcommand
     status_parser = subparsers.add_parser("status", help="Check status")
