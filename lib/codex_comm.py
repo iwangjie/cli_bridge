@@ -12,6 +12,7 @@ import re
 import sys
 import time
 import shlex
+import heapq
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
@@ -42,6 +43,71 @@ class CodexLogReader:
             poll = 0.05
         self._poll_interval = min(0.5, max(0.01, poll))
 
+    @staticmethod
+    def _parse_iso_ts(value: Any) -> Optional[float]:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        # Codex logs often use RFC3339 "Z" suffix.
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(text).timestamp()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _norm_path(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        s = value.strip()
+        if not s:
+            return ""
+        try:
+            s = os.path.expanduser(s)
+        except Exception:
+            pass
+        s = s.replace("\\", "/")
+        while len(s) > 1 and s.endswith("/"):
+            s = s[:-1]
+        return s
+
+    def _cwd_match_keys(self) -> set[str]:
+        keys: set[str] = set()
+        for raw in (os.environ.get("PWD"), str(Path.cwd())):
+            normalized = self._norm_path(raw)
+            if normalized:
+                keys.add(normalized)
+        try:
+            keys.add(self._norm_path(str(Path.cwd().resolve())))
+        except Exception:
+            pass
+        return keys
+
+    def _read_session_meta(self, path: Path) -> tuple[Optional[float], str]:
+        """
+        Returns (session_start_ts, cwd_norm) based on the first line (session_meta) if available.
+        """
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                first = handle.readline().strip()
+        except OSError:
+            return None, ""
+        if not first:
+            return None, ""
+        try:
+            entry = json.loads(first)
+        except Exception:
+            return None, ""
+        if not isinstance(entry, dict) or entry.get("type") != "session_meta":
+            return None, ""
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+        ts = self._parse_iso_ts(payload.get("timestamp")) or self._parse_iso_ts(entry.get("timestamp"))
+        cwd_norm = self._norm_path(payload.get("cwd"))
+        return ts, cwd_norm
+
     def set_preferred_log(self, log_path: Optional[Path]) -> None:
         self._preferred_log = self._normalize_path(log_path)
 
@@ -58,22 +124,56 @@ class CodexLogReader:
     def _scan_latest(self) -> Optional[Path]:
         if not self.root.exists():
             return None
+        # Heuristic: pick the most recently *started* session for this cwd (session_meta timestamp),
+        # not the newest-by-mtime file. Older sessions can keep updating (token_count), skewing mtime.
+        # To keep it fast, only inspect the N most recently modified files.
+        max_candidates = int(os.environ.get("CCB_CODEX_LOG_SCAN_LIMIT", "400") or 400)
+        max_candidates = max(50, min(2000, max_candidates))
+
         try:
-            # Avoid sorting the full list (can be slow on large histories / slow filesystems).
-            latest: Optional[Path] = None
-            latest_mtime = -1.0
+            newest_by_mtime: list[tuple[float, Path]] = []
             for p in (p for p in self.root.glob("**/*.jsonl") if p.is_file()):
                 try:
                     mtime = p.stat().st_mtime
                 except OSError:
                     continue
-                if mtime >= latest_mtime:
-                    latest = p
-                    latest_mtime = mtime
+                if len(newest_by_mtime) < max_candidates:
+                    heapq.heappush(newest_by_mtime, (mtime, p))
+                else:
+                    if mtime > newest_by_mtime[0][0]:
+                        heapq.heapreplace(newest_by_mtime, (mtime, p))
         except OSError:
             return None
 
-        return latest
+        if not newest_by_mtime:
+            return None
+
+        cwd_keys = self._cwd_match_keys()
+        best_path: Optional[Path] = None
+        best_score: tuple[float, float] = (-1.0, -1.0)  # (session_start_ts, mtime)
+
+        # Prefer matching cwd; if none match, fall back to best overall.
+        def consider(candidate: Path, mtime: float, require_cwd: bool) -> None:
+            nonlocal best_path, best_score
+            start_ts, cwd_norm = self._read_session_meta(candidate)
+            if require_cwd and cwd_keys and cwd_norm and cwd_norm not in cwd_keys:
+                return
+            # Use session start timestamp when present; otherwise fall back to mtime.
+            score = (start_ts if start_ts is not None else mtime, mtime)
+            if score >= best_score:
+                best_score = score
+                best_path = candidate
+
+        # First pass: require cwd match.
+        for mtime, p in sorted(newest_by_mtime, key=lambda x: x[0], reverse=True):
+            consider(p, mtime, require_cwd=True)
+        if best_path:
+            return best_path
+
+        # Fallback: any cwd.
+        for mtime, p in sorted(newest_by_mtime, key=lambda x: x[0], reverse=True):
+            consider(p, mtime, require_cwd=False)
+        return best_path
 
     def _latest_log(self) -> Optional[Path]:
         preferred = self._preferred_log
