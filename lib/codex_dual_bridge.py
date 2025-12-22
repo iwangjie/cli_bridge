@@ -56,9 +56,21 @@ class DualBridge:
         self.history_dir.mkdir(parents=True, exist_ok=True)
 
         terminal_type = os.environ.get("CODEX_TERMINAL", "tmux")
-        pane_id = os.environ.get("CODEX_WEZTERM_PANE") if terminal_type == "wezterm" else os.environ.get("CODEX_TMUX_SESSION")
-        if not pane_id:
-            raise RuntimeError(f"Missing {'CODEX_WEZTERM_PANE' if terminal_type == 'wezterm' else 'CODEX_TMUX_SESSION'} environment variable")
+        if terminal_type == "wezterm":
+            pane_id = (os.environ.get("CODEX_WEZTERM_PANE") or "").strip()
+            if not pane_id:
+                raise RuntimeError("Missing CODEX_WEZTERM_PANE environment variable")
+        else:
+            # tmux: prefer a pane-local id (TMUX_PANE) when the configured target is also a pane id.
+            # This avoids races when the launcher switches focus right after creating the pane.
+            pane_id = (os.environ.get("CODEX_TMUX_SESSION") or "").strip()
+            tmux_pane = (os.environ.get("TMUX_PANE") or "").strip()
+            if pane_id.startswith("%") and tmux_pane.startswith("%") and tmux_pane != pane_id:
+                pane_id = tmux_pane
+            if not pane_id and tmux_pane.startswith("%"):
+                pane_id = tmux_pane
+            if not pane_id:
+                raise RuntimeError("Missing CODEX_TMUX_SESSION environment variable")
 
         self.codex_session = TerminalCodexSession(terminal_type, pane_id)
         self._running = True

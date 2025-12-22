@@ -301,7 +301,16 @@ OUTPUT_FIFO="{output_fifo}"
 TMUX_LOG_FILE="{runtime}/bridge_output.log"
 CODEX_START_CMD={json.dumps(start_cmd)}
 
-PANE_ID="$(tmux display-message -p '#{{pane_id}}')"
+# Use TMUX_PANE (pane-local, race-free) instead of querying the "current" pane,
+# which can change if the launcher immediately re-selects another pane.
+PANE_ID="${{TMUX_PANE:-}}"
+if [ -z "$PANE_ID" ]; then
+    PANE_ID="$(tmux display-message -p '#{{pane_id}}' 2>/dev/null || true)"
+fi
+if [ -z "$PANE_ID" ]; then
+    echo "CCB: failed to detect tmux pane id" >&2
+    exit 1
+fi
 
 echo $$ > "$RUNTIME_DIR/codex.pid"
 export PYTHONPATH="$SCRIPT_DIR:${{PYTHONPATH:-}}"

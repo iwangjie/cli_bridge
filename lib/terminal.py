@@ -141,9 +141,14 @@ class TmuxBackend(TerminalBackend):
         sanitized = text.replace("\r", "").strip()
         if not sanitized:
             return
+        # Some TUIs (notably Codex) can miss the trailing Enter if it arrives too quickly after a burst
+        # of injected text. A small delay is typically enough and is configurable.
+        enter_delay = _env_float("CCB_TMUX_ENTER_DELAY", 0.05)
         # Fast-path for typical short, single-line commands (fewer tmux subprocess calls).
         if "\n" not in sanitized and len(sanitized) <= 200:
             subprocess.run(["tmux", "send-keys", "-t", session, "-l", sanitized], check=True)
+            if enter_delay:
+                time.sleep(enter_delay)
             subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
             return
 
@@ -152,7 +157,6 @@ class TmuxBackend(TerminalBackend):
         subprocess.run(["tmux", "load-buffer", "-b", buffer_name, "-"], input=encoded, check=True)
         try:
             subprocess.run(["tmux", "paste-buffer", "-t", session, "-b", buffer_name, "-p"], check=True)
-            enter_delay = _env_float("CCB_TMUX_ENTER_DELAY", 0.0)
             if enter_delay:
                 time.sleep(enter_delay)
             subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
